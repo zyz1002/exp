@@ -4,7 +4,7 @@ import logging
 import os
 import random
 import sys
-
+import torchvision
 sys.path.append(".")
 
 import numpy as np
@@ -20,7 +20,10 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 from model.PAR import PAR
 from utils import evaluate, imutils, optimizer
-from utils.camutils import cam_to_label, cam_to_roi_mask2, multi_scale_cam2, label_to_aff_mask, refine_cams_with_bkg_v2, crop_from_roi_neg
+# from utils.camutils import cam_to_label, cam_to_roi_mask2, multi_scale_cam2, label_to_aff_mask, refine_cams_with_bkg_v2, crop_from_roi_neg
+from utils.camutils import (cam_to_label, cam_to_roi_mask2, multi_scale_cam2, label_to_aff_mask,
+                            refine_cams_with_bkg_v2, crop_from_roi_neg,refine_cams_with_cls_label,
+                            propagte_aff_cam_with_bkg,multi_scale_cam_with_aff_mat,ignore_img_box)
 from utils.pyutils import AverageMeter, cal_eta, format_tabs, setup_logger
 torch.hub.set_dir("./pretrained")
 parser = argparse.ArgumentParser()
@@ -75,6 +78,10 @@ parser.add_argument("--save_ckpt", action="store_true", help="save_ckpt")
 parser.add_argument("--local_rank", default=-1, type=int, help="local_rank")
 parser.add_argument("--num_workers", default=10, type=int, help="num_workers")
 parser.add_argument('--backend', default='nccl')
+
+parser.add_argument("--cam_image_dir", default="cam_image", type=str, help="cam_image")
+parser.add_argument("--test_image_dir", default="test_image", type=str, help="test_cam_image")
+parser.add_argument("--all_image_dir", default="all", type=str, help="all_train_image")
 
 def setup_seed(seed):
     torch.manual_seed(seed)
@@ -320,7 +327,51 @@ def train(args=None):
 
             delta, eta = cal_eta(time0, n_iter + 1, args.max_iters)
             cur_lr = optim.param_groups[0]['lr']
+### 增加可视化环节
+            preds = torch.argmax(segs, dim=1, ).cpu().numpy().astype(np.int16)
+            gts = pseudo_label.cpu().numpy().astype(np.int16)
+            refined_gts = refined_pseudo_label.cpu().numpy().astype(np.int16)
+            # aff_gts = refined_aff_label.cpu().numpy().astype(np.int16)
 
+            seg_mAcc = (preds == gts).sum() / preds.size
+
+            grid_imgs, grid_cam = imutils.tensorboard_image(imgs=inputs.clone(), cam=valid_cam)
+
+            grid_labels = imutils.tensorboard_label(labels=gts)
+            grid_preds = imutils.tensorboard_label(labels=preds)
+            grid_refined_gt = imutils.tensorboard_label(labels=refined_gts)
+
+            # 保存类激活图，伪标签，优化后的伪标签（当作真实值），分割图
+            # 目录结构为 all-多个时间-cams（gts等）-多个迭代次数
+            if (n_iter + 1) >= 10 and args.local_rank == 0:
+                # all_file_names=['cams','pseudo_gts','pseudo_ref_gts','preds']
+                # all_file=[grid_cam.float(),grid_labels.float(),grid_refined_gt.float(),grid_preds.float()]
+                # all_file_names = ['cams', 'pseudo_gts', 'pseudo_ref_gts', 'preds', 'ref_cam']
+                all_file_names = ['cams', 'pseudo_gts', 'pseudo_ref_gts', 'preds']
+                all_file = [grid_cam.float(), grid_labels.float(), grid_refined_gt.float(), grid_preds.float()]
+                print('saving....all_file')
+                for i in range(len(all_file_names)):
+                    # file_dir_name = os.path.join(cfg.work_dir.all_dir, all_file_names[i],"%s_%d"%(all_file_names[i],n_iter+1))
+                    file_dir_name = os.path.join(args.all_image_dir, all_file_names[i])
+                    os.makedirs(file_dir_name, exist_ok=True)
+
+                    torchvision.utils.save_image(all_file[i], os.path.join(file_dir_name,
+                                                                           "%s_%d" % (all_file_names[i], n_iter + 1) +
+                                                                           img_name[0] + '.png'), normalize=True)
+
+            if args.local_rank == 0:
+                logging.info("Iter: %d; Elasped: %s; ETA: %s; LR: %.3e; cls_loss: %.4f, cls_loss_aux: %.4f, ptc_loss: %.4f, ctc_loss: %.4f, seg_loss: %.4f , word_loss: %.4f , hist_loss: %.4f..." % (n_iter + 1, delta, eta, cur_lr, avg_meter.pop('cls_loss'), avg_meter.pop('cls_loss_aux'), avg_meter.pop('ptc_loss'), avg_meter.pop('ctc_loss'), avg_meter.pop('seg_loss'),avg_meter.pop('word_loss'),avg_meter.pop('hist_loss')))
+
+                writer.add_image("train/images", grid_imgs, global_step=n_iter)
+                writer.add_image("train/preds", grid_preds, global_step=n_iter)
+                writer.add_image("train/pseudo_gts", grid_labels, global_step=n_iter)
+                writer.add_image("train/pseudo_ref_gts", grid_refined_gt, global_step=n_iter)
+                writer.add_image("cam/valid_cams", grid_cam, global_step=n_iter)
+
+                writer.add_scalars('train/loss', {"seg_loss": seg_loss.item(), "cls_loss": cls_loss.item()},
+                                   global_step=n_iter)
+                # writer.add_scalar('count/pos_count', pos_count.item(), global_step=n_iter)
+                # writer.add_scalar('count/neg_count', neg_count.item(), global_step=n_iter)
             if args.local_rank == 0:
                 logging.info("Iter: %d; Elasped: %s; ETA: %s; LR: %.3e; cls_loss: %.4f, cls_loss_aux: %.4f, ptc_loss: %.4f, ctc_loss: %.4f, seg_loss: %.4f..." % (n_iter + 1, delta, eta, cur_lr, avg_meter.pop('cls_loss'), avg_meter.pop('cls_loss_aux'), avg_meter.pop('ptc_loss'), avg_meter.pop('ctc_loss'), avg_meter.pop('seg_loss')))
 
@@ -346,11 +397,24 @@ if __name__ == "__main__":
     args.work_dir = os.path.join(args.work_dir, timestamp)
     args.ckpt_dir = os.path.join(args.work_dir, "checkpoints")
     args.pred_dir = os.path.join(args.work_dir, "predictions")
-
+    ############
+    args.cam_image_dir = os.path.join(args.work_dir, args.cam_image_dir)
+    args.test_image_dir = os.path.join(args.work_dir, args.test_image_dir)
+    args.all_image_dir = os.path.join(args.work_dir, args.all_image_dir)
+    args.tb_logger_dir = os.path.join(args.work_dir, "log")
+    # os.makedirs(args.all_image_dir, exist_ok=True)
+    # os.makedirs(args.cam_image_dir, exist_ok=True)
+    # os.makedirs(args.test_image_dir, exist_ok=True)
+    ###########
     if args.local_rank == 0:
         os.makedirs(args.ckpt_dir, exist_ok=True)
         os.makedirs(args.pred_dir, exist_ok=True)
 
+        ####
+        os.makedirs(args.all_image_dir, exist_ok=True)
+        os.makedirs(args.cam_image_dir, exist_ok=True)
+        os.makedirs(args.test_image_dir, exist_ok=True)
+        ####
         setup_logger(filename=os.path.join(args.work_dir, 'train.log'))
         logging.info('Pytorch version: %s' % torch.__version__)
         logging.info("GPU type: %s"%(torch.cuda.get_device_name(0)))
